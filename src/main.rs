@@ -6,6 +6,7 @@ mod dict;
 mod hash;
 mod myp;
 mod sniff;
+mod textures;
 
 use std::collections::HashMap;
 use std::fs;
@@ -78,6 +79,12 @@ usage:
       --threads N                      worker threads (default: all cores)
       -v                               print each file
   myp verify <archive.myp> [--deep]    check the table, and with --deep inflate every entry
+  myp textures <extract-dir> -o DIR   flat texture dir named the way models reference them
+      --copy                           copy instead of hardlink
+      --dry-run                        report only, write nothing
+      --check <nif-dir>                resolve texture references in NIFs against the result
+      --report                         list every collision and missing reference
+  myp find <archive-dir> <path>...     which archive holds a path, and where it was extracted
   myp hash <path>...                   print ph/sh for paths as the client hashes them
   myp dict [--check]                   dictionary stats, --check rehashes every row"
     );
@@ -91,6 +98,8 @@ fn main() {
         "verify" => cmd_verify(&cli),
         "hash" => cmd_hash(&cli),
         "dict" => cmd_dict(&cli),
+        "find" => cmd_find(&cli),
+        "textures" => cmd_textures(&cli),
         "probe" => cmd_probe(&cli),
         "help" | "-h" => {
             usage();
@@ -359,6 +368,292 @@ fn cmd_verify(cli: &Cli) -> i32 {
     } else {
         0
     }
+}
+
+fn cmd_find(cli: &Cli) -> i32 {
+    let dir = match cli.positional.first() {
+        Some(d) => PathBuf::from(d),
+        None => {
+            eprintln!("error: find needs a directory of archives, then paths");
+            return 2;
+        }
+    };
+    let wanted = &cli.positional[1..];
+    if wanted.is_empty() {
+        eprintln!("error: find needs at least one path");
+        return 2;
+    }
+
+    let mut archives: Vec<Archive> = Vec::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: {}: {e}", dir.display());
+            return 1;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("myp")) != Some(true) {
+            continue;
+        }
+        match Archive::open(&path) {
+            Ok(a) => archives.push(a),
+            Err(e) => eprintln!("  skip {}: {e}", path.display()),
+        }
+    }
+    if archives.is_empty() {
+        eprintln!("error: no .myp archives in {}", dir.display());
+        return 1;
+    }
+
+    let mut index: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
+    for (ai, a) in archives.iter().enumerate() {
+        for (ei, e) in a.entries.iter().enumerate() {
+            index.entry(e.hash).or_default().push((ai, ei));
+        }
+    }
+
+    let dict = Dict::load();
+    let mut found = 0usize;
+    let mut missing = 0usize;
+    for path in wanted {
+        let (ph, sh) = hash::war_hash(path);
+        let key = ((ph as u64) << 32) | sh as u64;
+        let known = dict.name(key);
+        match index.get(&key) {
+            Some(hits) => {
+                found += 1;
+                let mut places = Vec::new();
+                for (ai, ei) in hits {
+                    let a = &archives[*ai];
+                    let e = &a.entries[*ei];
+                    let ext = a
+                        .head(e, 192)
+                        .map(|h| sniff::detect(&h, true, e.method))
+                        .unwrap_or("bin");
+                    let stem = a
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    places.push(format!(
+                        "{} (crc {:08X}, {} bytes, {}, extracted as {}/{ext}/{}.{ext})",
+                        a.path.file_name().unwrap_or_default().to_string_lossy(),
+                        e.crc,
+                        e.uncompressed_size,
+                        ext,
+                        stem,
+                        e.fallback_name()
+                    ));
+                }
+                println!("{ph:08X}#{sh:08X}  {path}");
+                if known.is_some() {
+                    println!("   already in dictionary");
+                } else {
+                    println!("   NOT in dictionary: recoverable name");
+                }
+                for p in places {
+                    println!("   {p}");
+                }
+            }
+            None => {
+                missing += 1;
+                println!("{ph:08X}#{sh:08X}  {path}");
+                println!("   not in any archive given");
+            }
+        }
+    }
+    println!("\n{found} found, {missing} not found");
+    0
+}
+
+fn cmd_textures(cli: &Cli) -> i32 {
+    let root = match cli.positional.first() {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("error: textures needs an extracted tree, e.g. myp textures ~/Downloads/ror-extract -o ~/Downloads/ror-extract/textures");
+            return 2;
+        }
+    };
+    if !root.is_dir() {
+        eprintln!("error: {} is not a directory", root.display());
+        return 2;
+    }
+    let dry_run = cli.has("dry-run");
+    let copy = cli.has("copy");
+    let report = cli.has("report");
+
+    let out = match cli.flag("o").or_else(|| cli.flag("out")) {
+        Some(o) => PathBuf::from(o),
+        None => {
+            eprintln!("error: textures needs -o DIR");
+            return 2;
+        }
+    };
+
+    let groups = match textures::collect(&root, Some(&out)) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let scanned: usize = groups.iter().map(|g| g.sources.len()).sum();
+
+    let mut collisions = 0usize;
+    let mut differing: Vec<&textures::Group> = Vec::new();
+    for g in &groups {
+        if g.sources.len() > 1 {
+            collisions += 1;
+            let first = &g.sources[0];
+            let mut any_differs = false;
+            for other in &g.sources[1..] {
+                match textures::same_bytes(first, other) {
+                    Ok(true) => {}
+                    Ok(false) => any_differs = true,
+                    Err(e) => {
+                        eprintln!("  compare {}: {e}", other.display());
+                        any_differs = true;
+                    }
+                }
+            }
+            if any_differs {
+                differing.push(g);
+            }
+        }
+    }
+
+    let mut written = 0usize;
+    let mut linked = 0usize;
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+    if !dry_run {
+        if let Err(e) = fs::create_dir_all(&out) {
+            eprintln!("error: {}: {e}", out.display());
+            return 1;
+        }
+        for g in &groups {
+            let dest = out.join(&g.name);
+            if dest.exists() {
+                skipped += 1;
+                continue;
+            }
+            let src = &g.sources[0];
+            if copy {
+                match fs::copy(src, &dest) {
+                    Ok(_) => {
+                        written += 1;
+                        copied += 1;
+                    }
+                    Err(e) => eprintln!("  copy {}: {e}", src.display()),
+                }
+            } else {
+                match fs::hard_link(src, &dest) {
+                    Ok(_) => {
+                        written += 1;
+                        linked += 1;
+                    }
+                    Err(_) => match fs::copy(src, &dest) {
+                        Ok(_) => {
+                            written += 1;
+                            copied += 1;
+                        }
+                        Err(e) => eprintln!("  copy {}: {e}", src.display()),
+                    },
+                }
+            }
+        }
+    }
+
+    println!("{}", root.display());
+    println!(
+        "  texture files {scanned}   canonical names {}   collisions {collisions}   of those differing {}{}",
+        groups.len(),
+        differing.len(),
+        if dry_run { "   (dry run, nothing written)" } else { "" }
+    );
+    if !dry_run {
+        println!(
+            "  wrote {written} into {} ({linked} hardlinked, {copied} copied, {skipped} already there)",
+            out.display()
+        );
+    }
+
+    if report && !differing.is_empty() {
+        println!("\nsame name, different pixels:");
+        for g in differing.iter().take(200) {
+            let dirs: Vec<String> = g
+                .sources
+                .iter()
+                .map(|p| {
+                    p.parent()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            println!("   {}  <- {}", g.name, dirs.join("  "));
+        }
+        if differing.len() > 200 {
+            println!("   ... and {} more", differing.len() - 200);
+        }
+    }
+
+    if let Some(nif_dir) = cli.flag("check") {
+        let have: std::collections::HashSet<String> =
+            groups.iter().map(|g| g.name.clone()).collect();
+        let mut nifs = 0usize;
+        let mut refs = 0usize;
+        let mut missing: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut stack = vec![PathBuf::from(nif_dir)];
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("nif") {
+                    continue;
+                }
+                let data = match fs::read(&path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                nifs += 1;
+                for name in textures::texture_refs(&data) {
+                    refs += 1;
+                    if !have.contains(&name) {
+                        *missing.entry(name).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let unresolved: usize = missing.values().sum();
+        let pct = if refs > 0 {
+            100.0 * (refs - unresolved) as f64 / refs as f64
+        } else {
+            100.0
+        };
+        println!(
+            "\nnif check: {nifs} files, {refs} references, {} resolved ({pct:.2}%), {unresolved} unresolved",
+            refs - unresolved
+        );
+        if report {
+            for (name, n) in missing.iter().take(50) {
+                println!("   missing {name} (x{n})");
+            }
+            if missing.len() > 50 {
+                println!("   ... and {} more names", missing.len() - 50);
+            }
+        }
+    }
+
+    0
 }
 
 fn cmd_hash(cli: &Cli) -> i32 {
