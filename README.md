@@ -2,7 +2,7 @@
 
 A `myp` command line tool for Warhammer Online archives, with the community filename dictionary built in. One binary, no Windows-only runtime, no GUI.
 
-The original [EasyMYP](https://github.com/) is a .NET Framework 3.5 WinForms application. Microsoft has not shipped 3.5 since Windows 10, and it never ran on macOS or Linux, so repacking assets on a modern machine meant fighting a 2008 runtime. This does the same job from a terminal.
+The original [EasyMYP](https://github.com/WarEmu/EasyMYP) is a .NET Framework 3.5 WinForms application. Microsoft has not shipped 3.5 since Windows 10, and it never ran on macOS or Linux, so repacking assets on a modern machine meant fighting a 2008 runtime. This does the same job from a terminal.
 
 ## What it does
 
